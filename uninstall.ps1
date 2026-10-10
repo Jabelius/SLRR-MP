@@ -1,9 +1,18 @@
 # SLRR-MP uninstall. Run with the game closed. Restores originals from backup-original\.
 param([string]$Game)
 $ErrorActionPreference = 'Stop'
-# buddy zip: this folder sits inside the game folder; dev repo: default install
+# buddy zip: this folder sits inside the game folder
 if (-not $Game) { $Game = Split-Path $PSScriptRoot }
-if (-not (Test-Path (Join-Path $Game 'StreetLegal_Redline.exe'))) { $Game = '<game folder>' }
+if (-not (Test-Path (Join-Path $Game 'StreetLegal_Redline.exe'))) {
+	# elsewhere (dev checkout): find the game in Steam's library folders
+	$steam = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
+	$vdf = if ($steam) { Join-Path $steam 'steamapps\libraryfolders.vdf' }
+	if ($vdf -and (Test-Path $vdf)) {
+		$Game = Select-String -Path $vdf -Pattern '"path"\s+"(.+)"' |
+			ForEach-Object { Join-Path ($_.Matches[0].Groups[1].Value -replace '\\\\', '\') 'steamapps\common\Street Legal Racing Redline' } |
+			Where-Object { Test-Path (Join-Path $_ 'StreetLegal_Redline.exe') } | Select-Object -First 1
+	}
+}
 if (-not (Test-Path (Join-Path $Game 'StreetLegal_Redline.exe'))) { throw 'Game not found. Put the SLRR-MP folder inside the game folder.' }
 if (Get-Process StreetLegal_Redline -ErrorAction SilentlyContinue) { throw 'Close the game first.' }
 $bak = Join-Path $PSScriptRoot 'backup-original'

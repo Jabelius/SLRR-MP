@@ -5,3 +5,4 @@ obj/
 backup-original/
 *.log
 dist/
+PLAN.md
