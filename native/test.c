@@ -28,8 +28,10 @@ int main(void)
 	double now = 59 / 30.0 + 0.05;
 	snapshot(s, sizeof s, now);
 	assert(field(s, 0) == 1 && field(s, 1) == 7 && field(s, 2) == 2687270);
-	// render time = now - min latency(0.05) - delay(0.1) in sender clock
-	float want = (float)(10 * (1000 + now - 0.05 - 0.1));
+	// offset converges toward the 50-70 ms latency without stepping; render time = now - off - delay
+	double off = peers[0].off;
+	assert(off > -1000 + 0.05 - 1e-6 && off < -1000 + 0.07);
+	float want = (float)(10 * (now - off - 0.1));
 	assert(fabsf(field(s, 4) - want) < 0.05f);
 
 	// extrapolation capped at 250 ms past the newest sample
@@ -57,6 +59,23 @@ int main(void)
 	assert(field(s, 0) == 1);
 	snapshot(s, sizeof s, now + 10);
 	assert(!strcmp(s, "0"));
+
+	// smoothness: 30 Hz sends, arrivals drained on a 60 Hz tick with 0-15 ms extra latency;
+	// rendered x must advance evenly every tick (old min-tracker stepped here)
+	double base = 500, prev = 0;
+	int sent = 0;
+	for (int tick = 0; tick < 600; tick++) {
+		double tnow = base + tick / 60.0;
+		while (sent / 30.0 + (sent * 7 % 16) / 1000.0 <= tick / 60.0) {
+			double t = 2000 + sent / 30.0;
+			feed(3, t, (float)(10 * sent / 30.0), 0, 0, tnow);
+			sent++;
+		}
+		snapshot(s, sizeof s, tnow);
+		double x = field(s, 4);
+		if (tick > 300) assert(fabs((x - prev) - 10 / 60.0) < 0.02);
+		prev = x;
+	}
 
 	puts("bridge tests ok");
 	return 0;

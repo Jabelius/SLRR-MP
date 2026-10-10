@@ -57,6 +57,17 @@ var trail = new Queue<(double at, string state)>();
 
 void NetSend(string msg, IPEndPoint to) { net!.Send(Encoding.ASCII.GetBytes(msg), to); tx++; }
 
+string? lastOwn = null; // last own state; null once "away" went out
+
+void SendOwn(string state)
+{
+	if (mode == "fake") trail.Enqueue((Now(), state));
+	else if (echo || !Due(state)) { }
+	else if (mode == "host") foreach (var ep in peers.Keys) NetSend($"S 0 {name} {state}", ep);
+	else NetSend($"S {name} {state}", hostEp!);
+	if (!state.EndsWith(" 0")) lastOwn = null;
+}
+
 // throttle to SendHz, but never drop a state with flags (away)
 bool Due(string state)
 {
@@ -93,10 +104,8 @@ _ = Task.Run(async () =>
 		{
 			game = r.RemoteEndPoint;
 			gameSeen = Now();
-			if (mode == "fake") trail.Enqueue((Now(), state));
-			else if (echo || !Due(state)) { }
-			else if (mode == "host") foreach (var ep in peers.Keys) NetSend($"S 0 {name} {state}", ep);
-			else NetSend($"S {name} {state}", hostEp!);
+			lastOwn = state;
+			SendOwn(state);
 		}
 	}
 });
@@ -161,6 +170,8 @@ while (true)
 	lock (gate)
 	{
 		if (mode == "join") NetSend($"P {Now():0.000} {name}", hostEp!);
+		// game left the City, quit or crashed without saying so: tell the others
+		if (lastOwn != null && Now() - gameSeen > 1) SendOwn(lastOwn[..lastOwn.LastIndexOf(' ')] + " 1");
 		foreach (var ep in peers.Where(kv => Now() - kv.Value.Seen > cfg.PeerTimeoutMs / 1000.0).Select(kv => kv.Key).ToList())
 		{
 			Console.WriteLine($"\n- peer {peers[ep].Id} {peers[ep].Name} timed out");

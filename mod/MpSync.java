@@ -40,13 +40,14 @@ public class MpSync implements Runnable
 		thread.start();
 	}
 
-	//"t type color x y z yaw pitch roll vx vy vz flags", flags 1 = away
+	//"t type color x y z yaw pitch roll vx vy vz flags", flags 1 = away.
+	//t is the physics clock: it matches the sampled pose exactly (wall clock is off by up to a frame) and freezes on pause.
 	public String state(int flags)
 	{
 		Vector3 p = car.getPos();
 		Ypr o = car.getOri();
 		Vector3 v = car.getVel();
-		return System.currentTime() + " " + type + " " + color + " " + p.x + " " + p.y + " " + p.z + " " + o.y + " " + o.p + " " + o.r + " " + v.x + " " + v.y + " " + v.z + " " + flags;
+		return System.simTime() + " " + type + " " + color + " " + p.x + " " + p.y + " " + p.z + " " + o.y + " " + o.p + " " + o.r + " " + v.x + " " + v.y + " " + v.z + " " + flags;
 	}
 
 	public void run()
@@ -108,12 +109,14 @@ public class MpSync implements Runnable
 
 	public void stop()
 	{
+		log("exit city");
 		if(!thread) return;
 		thread.stop();
+		log("sync thread stopped");
 		NetworkEngine.httpRequest("MP", "", "", state(1));
 		for(int i=0; i<ghosts.size(); i++) { MpGhost g = ghosts.elementAt(i); g.destroy(); }
 		ghosts.removeAllElements();
-		log("exit city");
+		log("ghosts removed");
 	}
 }
 

@@ -68,8 +68,10 @@ static void on_packet(const char *msg, double now)
 	q->type = type;
 	q->color = color;
 	q->last_rx = now;
-	// clock offset tracks the fastest delivery; ponytail: fixed 0.5 ms/sample relax for drift, Kalman-ish filter if jitter shows
-	q->off = fmin(now - t, q->off + 0.0005);
+	// clock offset = slow average of (arrival - send) time: absorbs the ~16 ms tick quantization of `now`
+	// without moving the render clock in steps. A jump > 1 s (sender restarted) resets it.
+	double o = now - t;
+	q->off = fabs(o - q->off) > 1 ? o : q->off + (o - q->off) * 0.02;
 	if (q->n < HIST) q->n++;
 	else q->head = (q->head + 1) % HIST;
 	*nth(q, q->n - 1) = x;
