@@ -29,12 +29,14 @@ function Hook([string]$anchor, [string]$insert) {
 	$script:city = $script:city.Insert($i + $anchor.Length, $insert)
 }
 Hook "public class City extends Track`r`n{" "`r`n`tMpSync mpSync; //SLRR-MP"
-Hook 'super.enter(prev_state); //waits for loading to finish' "`r`n`t`tmpSync = new MpSync(map, player.car); //SLRR-MP"
+Hook 'super.enter(prev_state); //waits for loading to finish' "`r`n`t`tmpSync = new MpSync(this, map, player.car); //SLRR-MP"
 Hook "public void exit(GameState next_state)`r`n`t{" "`r`n`t`tif(mpSync) { mpSync.stop(); mpSync = null; } //SLRR-MP"
 [IO.File]::WriteAllText((Join-Path $Game $cityJava), $city, $enc)
 
 Remove-Item (Join-Path $Game 'sl\Scripts\game\src\MpSpike.java'), (Join-Path $Game 'sl\Scripts\game\MpSpike.class') -ErrorAction SilentlyContinue
 Copy-Item (Join-Path $PSScriptRoot 'mod\MpSync.java') (Join-Path $Game 'sl\Scripts\game\src\MpSync.java') -Force
+New-Item -ItemType Directory -Force (Join-Path $Game 'slrr-mp-cars') | Out-Null
+Remove-Item (Join-Path $Game 'save\temp\mp_own.car*'), (Join-Path $Game 'save\temp\mp') -Recurse -ErrorAction SilentlyContinue
 $ini = Join-Path $Game 'slrr-mp.ini'
 if (-not (Test-Path $ini)) { Copy-Item (Join-Path $PSScriptRoot 'mod\slrr-mp.ini') $ini }
 Copy-Item (Join-Path $PSScriptRoot 'native\dinput8.dll') $dll -Force

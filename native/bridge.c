@@ -35,15 +35,36 @@ static void logm(const char *fmt, ...)
 #define MAXP 16
 #define HIST 32
 typedef struct { double t; float p[3], r[3], v[3]; } Sample;
-typedef struct { int used, id, type, color, n, head; double off, last_rx; Sample s[HIST]; } Peer;
+typedef struct { int used, id, type, color, n, head; double off, last_rx; char name[17]; Sample s[HIST]; } Peer;
 static Peer peers[MAXP];
 
 static Sample *nth(Peer *q, int i) { return &q->s[(q->head + i) % HIST]; } // 0 = oldest
 
 static void drop_peer(Peer *q) { memset(q, 0, sizeof *q); }
 
-// car file per remote id, from SlrrMp once the transfer completed: "F id save/temp/mp/<hash>.car"
+// car file per remote id, from SlrrMp once the transfer completed: "F id slrr-mp-cars/<hash>.car"
 static struct { int id; char path[96]; } cars[MAXP];
+
+// chat lines from SlrrMp ("C who: text"), handed to the script one per CHAT call
+#define CHATN 8
+static char chat[CHATN][128];
+static int chat_head, chat_n;
+
+static void push_chat(const char *line)
+{
+	snprintf(chat[(chat_head + chat_n) % CHATN], sizeof chat[0], "%s", line);
+	if (chat_n < CHATN) chat_n++;
+	else chat_head = (chat_head + 1) % CHATN; // full: drop the oldest
+}
+
+static const char *pop_chat(void)
+{
+	if (!chat_n) return 0;
+	const char *c = chat[chat_head];
+	chat_head = (chat_head + 1) % CHATN;
+	chat_n--;
+	return c;
+}
 
 static const char *car_of(int id)
 {
@@ -69,10 +90,11 @@ static void on_packet(const char *msg, double now)
 	int id, type, color, flags;
 	double t;
 	Sample x;
-	char path[96];
+	char path[96], name[17];
 	if (sscanf(msg, "F %d %95s", &id, path) == 2) { set_car(id, path); return; }
-	if (sscanf(msg, "S %d %*s %lf %d %d %f %f %f %f %f %f %f %f %f %d", &id, &t, &type, &color,
-		&x.p[0], &x.p[1], &x.p[2], &x.r[0], &x.r[1], &x.r[2], &x.v[0], &x.v[1], &x.v[2], &flags) != 14) return;
+	if (msg[0] == 'C' && msg[1] == ' ') { push_chat(msg + 2); return; }
+	if (sscanf(msg, "S %d %16s %lf %d %d %f %f %f %f %f %f %f %f %f %d", &id, name, &t, &type, &color,
+		&x.p[0], &x.p[1], &x.p[2], &x.r[0], &x.r[1], &x.r[2], &x.v[0], &x.v[1], &x.v[2], &flags) != 15) return;
 	x.t = t;
 	Peer *q = 0, *free_slot = 0;
 	for (int i = 0; i < MAXP; i++) {
@@ -90,6 +112,7 @@ static void on_packet(const char *msg, double now)
 	if (q->n && t <= nth(q, q->n - 1)->t) return; // late/duplicate datagram
 	q->type = type;
 	q->color = color;
+	memcpy(q->name, name, sizeof name);
 	q->last_rx = now;
 	// clock offset = slow average of (arrival - send) time: absorbs the ~16 ms tick quantization of `now`
 	// without moving the render clock in steps. A jump > 1 s (sender restarted) resets it.
@@ -125,7 +148,7 @@ static void interp(Peer *q, double now, float p[3], float r[3])
 	for (int k = 0; k < 3; k++) { p[k] = a->p[k] + (b->p[k] - a->p[k]) * f; r[k] = lerp_angle(a->r[k], b->r[k], f); }
 }
 
-// "n id type color car x y z yaw pitch roll ..." for the script; car = file path or "-"
+// "n id name type color car x y z yaw pitch roll ..." for the script; car = file path or "-"
 static void snapshot(char *out, size_t cap, double now)
 {
 	int n = 0;
@@ -137,8 +160,8 @@ static void snapshot(char *out, size_t cap, double now)
 		if ((now - q->last_rx) * 1000 > cfg_timeout_ms) { drop_peer(q); continue; }
 		float p[3], r[3];
 		interp(q, now, p, r);
-		len += snprintf(body + len, sizeof body - len, " %d %d %d %s %.3f %.3f %.3f %.4f %.4f %.4f",
-			q->id, q->type, q->color, car_of(q->id), p[0], p[1], p[2], r[0], r[1], r[2]);
+		len += snprintf(body + len, sizeof body - len, " %d %s %d %d %s %.3f %.3f %.3f %.4f %.4f %.4f",
+			q->id, q->name, q->type, q->color, car_of(q->id), p[0], p[1], p[2], r[0], r[1], r[2]);
 		if (len >= sizeof body) break;
 		n++;
 	}
@@ -218,6 +241,10 @@ static void *__cdecl mp_native(void *ctx)
 	if (!strcmp(method, "CAR")) { // own car saved to this game-relative path
 		snprintf(own_car, sizeof own_car, "%s", body ? body : "");
 		return 0;
+	}
+	if (!strcmp(method, "CHAT")) { // next chat line or null
+		const char *c = pop_chat();
+		return c ? make_str(*(void **)ctx, c) : 0;
 	}
 	if (!strcmp(method, "MP")) {
 		net_pump(body);

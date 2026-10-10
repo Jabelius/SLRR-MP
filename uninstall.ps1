@@ -10,7 +10,7 @@ $bak = Join-Path $PSScriptRoot 'backup-original'
 foreach ($f in 'sl\Scripts\game\src\City.java', 'sl\Scripts\game\City.class') {
 	Copy-Item (Join-Path $bak $f) (Join-Path $Game $f) -Force
 }
-foreach ($f in 'dinput8.dll', 'slrr-mp.ini', 'slrr-mp.log', 'sl\Scripts\game\src\MpSync.java', 'sl\Scripts\game\MpSync.class', 'sl\Scripts\game\MpGhost.class', 'sl\Scripts\game\src\MpSpike.java', 'sl\Scripts\game\MpSpike.class', 'save\temp\mp_own.car', 'save\temp\mp') {
+foreach ($f in 'dinput8.dll', 'slrr-mp.ini', 'slrr-mp.log', 'sl\Scripts\game\src\MpSync.java', 'sl\Scripts\game\MpSync.class', 'sl\Scripts\game\MpGhost.class', 'sl\Scripts\game\src\MpSpike.java', 'sl\Scripts\game\MpSpike.class', 'save\temp\mp_own.car', 'save\temp\mp', 'slrr-mp-cars') {
 	Remove-Item (Join-Path $Game $f) -Recurse -ErrorAction SilentlyContinue
 }
 "Uninstalled from $Game."

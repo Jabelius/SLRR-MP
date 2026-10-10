@@ -27,35 +27,40 @@ int main(void)
 	}
 	double now = 59 / 30.0 + 0.05;
 	snapshot(s, sizeof s, now);
-	assert(field(s, 0) == 1 && field(s, 1) == 7 && field(s, 2) == 2687270);
+	assert(field(s, 0) == 1 && field(s, 1) == 7 && field(s, 3) == 2687270);
 	// offset converges toward the 50-70 ms latency without stepping; render time = now - off - delay
 	double off = peers[0].off;
 	assert(off > -1000 + 0.05 - 1e-6 && off < -1000 + 0.07);
 	float want = (float)(10 * (now - off - 0.1));
-	assert(fabsf(field(s, 5) - want) < 0.05f);
+	assert(fabsf(field(s, 6) - want) < 0.05f);
 
 	// car file mapping shows up in the snapshot, "-" until known
-	assert(strstr(s, " 7 2687270 1 - "));
-	on_packet("F 7 save/temp/mp/0123abcd.car", now);
+	assert(strstr(s, " 7 bob 2687270 1 - "));
+	on_packet("F 7 slrr-mp-cars/0123abcd.car", now);
 	snapshot(s, sizeof s, now);
-	assert(strstr(s, " 7 2687270 1 save/temp/mp/0123abcd.car "));
+	assert(strstr(s, " 7 bob 2687270 1 slrr-mp-cars/0123abcd.car "));
+
+	// chat queue: FIFO, null when empty
+	on_packet("C bob: hi there", now);
+	on_packet("C amy: yo", now);
+	assert(!strcmp(pop_chat(), "bob: hi there") && !strcmp(pop_chat(), "amy: yo") && !pop_chat());
 
 	// extrapolation capped at 250 ms past the newest sample
 	snapshot(s, sizeof s, now + 2);
-	assert(fabsf(field(s, 5) - (float)(10 * (1000 + 59 / 30.0 + 0.25))) < 0.05f);
+	assert(fabsf(field(s, 6) - (float)(10 * (1000 + 59 / 30.0 + 0.25))) < 0.05f);
 
 	// garbage and late datagrams are ignored
 	on_packet("S 7 bob nonsense", now);
 	feed(7, 1000, 0, 0, 0, now);
 	snapshot(s, sizeof s, now);
-	assert(fabsf(field(s, 5) - want) < 0.05f);
+	assert(fabsf(field(s, 6) - want) < 0.05f);
 
 	// yaw lerps across +-pi the short way
 	feed(8, 0.0, 0, 3.1f, 0, 0.0);
 	feed(8, 1.0, 0, -3.1f, 0, 1.0);
 	cfg_delay_ms = 500;
 	snapshot(s, sizeof s, 1.0);
-	float yaw = field(s, 18); // peer 8 yaw (record 2 = fields 11-20)
+	float yaw = field(s, 20); // peer 8 yaw (record 2 = fields 12-22)
 	assert(fabsf(fabsf(yaw) - 3.1416f) < 0.01f);
 	cfg_delay_ms = 100;
 
@@ -78,7 +83,7 @@ int main(void)
 			sent++;
 		}
 		snapshot(s, sizeof s, tnow);
-		double x = field(s, 5);
+		double x = field(s, 6);
 		if (tick > 300) assert(fabs((x - prev) - 10 / 60.0) < 0.02);
 		prev = x;
 	}

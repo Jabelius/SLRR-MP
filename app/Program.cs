@@ -4,8 +4,9 @@
 //   SlrrMp fake                         offline: your own trail replayed as a second car
 //   --echo (join)                       send the host's car back as yours, offset: tests the full network path
 //   --bridge <port>                     local game bridge port (run a second instance without a game)
-// Car look: each player's saved car file is pulled in chunks by content hash (K announce, G request, D data)
-// and handed to the bridge as save/temp/mp/<hash>.car.
+// Type a line + Enter to chat; it shows up in everyone's game. Status is in the window title.
+// Car look: each player's saved car (main file + its .1 .2 ... part files, bundled) is pulled in chunks by
+// content hash (K announce, G request, D data) and unpacked for the bridge as slrr-mp-cars/<hash>.car[.n].
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
@@ -137,13 +138,22 @@ if (net != null) _ = Task.Run(async () =>
 			if (OnCarMessage(msg, r.RemoteEndPoint)) continue;
 			if (mode == "host")
 			{
-				if (f.Length < 3 || (f[0] != "S" && f[0] != "P")) continue;
+				if (f.Length < 2 || (f[0] != "S" && f[0] != "P" && f[0] != "C")) continue;
 				if (!peers.TryGetValue(r.RemoteEndPoint, out var p))
 				{
 					p = peers[r.RemoteEndPoint] = new Peer(nextId++);
-					Console.WriteLine($"\n+ peer {p.Id} {r.RemoteEndPoint}");
+					Console.WriteLine($"+ peer {p.Id} {r.RemoteEndPoint}");
 				}
 				p.Seen = Now();
+				if (f[0] == "C")
+				{
+					var text = Proto.CleanText(msg[2..]);
+					if (text.Length == 0) continue;
+					Chat(p.Name, text);
+					foreach (var ep in peers.Keys) if (!ep.Equals(r.RemoteEndPoint)) NetSend($"C {p.Id} {p.Name} {text}", ep);
+					continue;
+				}
+				if (f.Length < 3) continue;
 				if (f[0] == "P") { p.Name = Proto.CleanName(f[2]); NetSend($"Q {f[1]}", r.RemoteEndPoint); continue; }
 				if (!Proto.ValidState(f[2])) continue;
 				p.Name = Proto.CleanName(f[1]);
@@ -154,11 +164,34 @@ if (net != null) _ = Task.Run(async () =>
 			else if (r.RemoteEndPoint.Equals(hostEp))
 			{
 				if (f[0] == "Q" && double.TryParse(f[1], out var sent)) ping = Now() - sent;
+				if (f[0] == "C" && msg.Split(' ', 4) is [_, _, var who, var said]) Chat(Proto.CleanName(who), Proto.CleanText(said));
 				var s = msg.Split(' ', 4);
 				if (f[0] != "S" || s.Length < 4 || !int.TryParse(s[1], out _) || !Proto.ValidState(s[3])) continue;
 				ToGame($"S {s[1]} {Proto.CleanName(s[2])} {s[3]}");
 				if (echo && s[1] == "0" && Due(s[3])) NetSend($"S {name} {Proto.Offset(s[3], cfg.FakeOffsetM)}", hostEp!);
 			}
+		}
+	}
+});
+
+void Chat(string who, string text)
+{
+	Console.WriteLine($"{who}: {text}");
+	ToGame($"C {who}: {text}");
+}
+
+// chat: lines typed here go to everyone's game
+_ = Task.Run(() =>
+{
+	while (Console.ReadLine() is { } line)
+	{
+		var text = Proto.CleanText(line);
+		if (text.Length == 0) continue;
+		lock (gate)
+		{
+			if (mode == "host") foreach (var ep in peers.Keys) NetSend($"C 0 {name} {text}", ep);
+			else if (mode == "join") NetSend($"C {text}", hostEp!);
+			else ToGame($"C {name}: {text}"); // fake: see it yourself
 		}
 	}
 });
@@ -170,7 +203,7 @@ void OnGameFile(string m)
 	if (gameDir == null) return;
 	try
 	{
-		var bytes = File.ReadAllBytes(Path.Combine(gameDir, m[2..]));
+		var bytes = CarStore.Bundle(Path.Combine(gameDir, m[2..]));
 		if (CarStore.Valid(bytes)) ownHash = cars.Add(bytes);
 	}
 	catch (IOException) { }
@@ -256,12 +289,12 @@ while (true)
 		if (lastOwn != null && Now() - gameSeen > 1) SendOwn(lastOwn[..lastOwn.LastIndexOf(' ')] + " 1");
 		foreach (var ep in peers.Where(kv => Now() - kv.Value.Seen > cfg.PeerTimeoutMs / 1000.0).Select(kv => kv.Key).ToList())
 		{
-			Console.WriteLine($"\n- peer {peers[ep].Id} {peers[ep].Name} timed out");
+			Console.WriteLine($"- peer {peers[ep].Id} {peers[ep].Name} timed out");
 			peers.Remove(ep);
 		}
 		var who = mode == "host" ? $"peers={peers.Count} [{string.Join(",", peers.Values.Select(p => p.Name))}]"
 			: mode == "join" ? $"ping={(ping < 0 ? "-" : $"{ping * 1000:0}ms")}" : "fake";
-		Console.Write($"\r{who} game={(Now() - gameSeen < 2 ? "in city" : "-")} rx={rx}/s tx={tx}/s        ");
+		Console.Title = $"SlrrMp {mode} {who} game={(Now() - gameSeen < 2 ? "in city" : "-")} rx={rx}/s tx={tx}/s";
 		rx = tx = 0;
 	}
 }
@@ -277,16 +310,52 @@ class Peer(int id)
 // car files by content hash: complete ones can be served, wanted ones are pulled chunk by chunk
 class CarStore
 {
-	const int ChunkSize = 768, MaxSize = 256 * 1024, Burst = 16;
+	const int ChunkSize = 768, MaxSize = 4 << 20, Burst = 32, MaxPart = 64;
 	readonly Dictionary<string, byte[]> done = [];
 	readonly Dictionary<string, (byte[]?[] parts, IPEndPoint from)> wanted = [];
 
 	public static string Hash(byte[] b) => Convert.ToHexString(SHA256.HashData(b))[..16].ToLowerInvariant();
 	public static bool IsHash(string h) => h.Length == 16 && h.All(char.IsAsciiHexDigitLower);
 
-	// Vehicle.save file: "SDAT" ... 0x88664422 version 5
-	public static bool Valid(byte[] b) => b.Length is >= 16 and <= MaxSize && b[0] == 'S' && b[1] == 'D' && b[2] == 'A' && b[3] == 'T'
-		&& BitConverter.ToUInt32(b, 8) == 0x88664422 && BitConverter.ToInt32(b, 12) == 5;
+	// bundle = entries of [int index][int length][bytes]; index 0 = main file, n = "<file>.n"
+	public static byte[] Bundle(string main)
+	{
+		var ms = new MemoryStream();
+		var w = new BinaryWriter(ms);
+		for (int i = 0; i <= MaxPart; i++)
+		{
+			var path = i == 0 ? main : $"{main}.{i}";
+			if (!File.Exists(path)) continue;
+			var b = File.ReadAllBytes(path);
+			w.Write(i);
+			w.Write(b.Length);
+			w.Write(b);
+		}
+		return ms.ToArray();
+	}
+
+	public static List<(int index, byte[] data)>? Unbundle(byte[] b)
+	{
+		var parts = new List<(int, byte[])>();
+		for (int o = 0; o < b.Length;)
+		{
+			if (o + 8 > b.Length) return null;
+			int i = BitConverter.ToInt32(b, o), n = BitConverter.ToInt32(b, o + 4);
+			if (i is < 0 or > MaxPart || n < 0 || o + 8 + n > b.Length || parts.Any(p => p.Item1 == i)) return null;
+			parts.Add((i, b[(o + 8)..(o + 8 + n)]));
+			o += 8 + n;
+		}
+		return parts;
+	}
+
+	// main file is a Vehicle.save file: "SDAT" ... 0x88664422 version 5
+	public static bool Valid(byte[] bundle)
+	{
+		if (bundle.Length > MaxSize || Unbundle(bundle) is not { } parts) return false;
+		var b = parts.FirstOrDefault(p => p.index == 0).data;
+		return b is { Length: >= 16 } && b[0] == 'S' && b[1] == 'D' && b[2] == 'A' && b[3] == 'T'
+			&& BitConverter.ToUInt32(b, 8) == 0x88664422 && BitConverter.ToInt32(b, 12) == 5;
+	}
 
 	public string Add(byte[] b)
 	{
@@ -327,17 +396,19 @@ class CarStore
 				yield return ($"G {h} {i}", w.from);
 	}
 
-	// writes save/temp/mp/<hash>.car once; returns the game-relative path when the file is ready
+	// writes slrr-mp-cars/<hash>.car once; returns the game-relative path when the file is ready
 	public string? Write(string h, string gameDir)
 	{
 		if (!done.TryGetValue(h, out var b)) return null;
-		var path = Path.Combine(gameDir, "save", "temp", "mp", h + ".car");
+		var path = Path.Combine(gameDir, "slrr-mp-cars", h + ".car");
 		if (!File.Exists(path))
 		{
 			Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-			File.WriteAllBytes(path, b);
+			// part files first: the main file appearing means the set is complete
+			foreach (var (i, data) in Unbundle(b)!.OrderByDescending(p => p.index))
+				File.WriteAllBytes(i == 0 ? path : $"{path}.{i}", data);
 		}
-		return $"save/temp/mp/{h}.car";
+		return $"slrr-mp-cars/{h}.car";
 	}
 }
 
@@ -376,6 +447,8 @@ static class Proto
 		f[3] = (double.Parse(f[3]) + meters).ToString("0.000");
 		return string.Join(' ', f);
 	}
+
+	public static string CleanText(string s) => new string(s.Where(c => c is >= ' ' and <= '~').Take(100).ToArray()).Trim();
 
 	public static string CleanName(string s)
 	{
