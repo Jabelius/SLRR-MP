@@ -34,7 +34,7 @@ string? Opt(string key)
 	argl.RemoveRange(i, 2);
 	return v;
 }
-await Updater.Run(cfg.UpdateRepo, args);
+Ui.Log(await Updater.Run(cfg.UpdateRepo, args));
 bool echo = argl.Remove("--echo");
 var name = Proto.CleanName(Opt("--name") ?? Environment.UserName);
 int bridgePort = int.Parse(Opt("--bridge") ?? cfg.BridgePort.ToString());
@@ -71,7 +71,8 @@ static class Relay
 		var peers = new Dictionary<IPEndPoint, Peer>();
 		int nextId = 1;
 		double ping = -1, lastSent = -99;
-		bool warned = false;
+		bool warned = false, hostLost = false;
+		double lastPong = 0;
 		var trail = new Queue<(double at, string state)>();
 		var cars = new CarStore();
 		string? gameDir = null, ownHash = null;
@@ -192,6 +193,8 @@ static class Relay
 						if (f[0] == "Q" && double.TryParse(f[1], out var sent))
 						{
 							ping = Now() - sent;
+						lastPong = Now();
+						if (hostLost) { hostLost = false; Ui.Log("Host is back."); }
 							var hv = f.ElementAtOrDefault(2) ?? "?";
 							if (hv != Updater.Version && !warned) { warned = true; Ui.Log($"! host runs SlrrMp {hv}, you run {Updater.Version}: update both"); }
 						}
@@ -228,7 +231,7 @@ static class Relay
 		// game told us its folder ("H dir") or where it saved our car ("F rel")
 		void OnGameFile(string m)
 		{
-			if (m[0] == 'H') { gameDir = m[2..]; return; }
+			if (m[0] == 'H') { if (gameDir != m[2..]) Ui.GameFound(m[2..]); gameDir = m[2..]; return; }
 			if (gameDir == null) return;
 			try
 			{
@@ -303,6 +306,13 @@ static class Relay
 			lock (gate)
 			{
 				if (mode == "join") NetSend($"P {Now():0.000} {name} {Updater.Version}", hostEp!);
+				// no pong for 5 s: host closed or crashed; keep trying, it resumes by itself when the host is back
+				if (mode == "join" && !hostLost && Now() - lastPong > 5)
+				{
+					hostLost = true;
+					ping = -1;
+					Ui.Log(lastPong == 0 ? "No answer from the host yet: check the IP, port forwarding or VPN." : "Lost the host. Your game continues; reconnects when the host is back.");
+				}
 				if (ownHash != null && cars.Size(ownHash) is int own)
 				{
 					if (mode == "join") NetSend($"K {ownHash} {own}", hostEp!);
@@ -322,7 +332,7 @@ static class Relay
 					peers.Remove(ep);
 				}
 				var who = mode == "host" ? $"peers={peers.Count} [{string.Join(",", peers.Values.Select(p => p.Name))}]"
-					: mode == "join" ? $"ping={(ping < 0 ? "-" : $"{ping * 1000:0}ms")}" : "fake";
+					: mode == "join" ? (hostLost ? "host not responding" : $"ping={(ping < 0 ? "-" : $"{ping * 1000:0}ms")}") : "fake";
 				Ui.Status($"{mode}  {who}  game: {(Now() - gameSeen < 2 ? "in city" : "not in city")}  rx {rx}/s  tx {tx}/s");
 				rx = tx = 0;
 			}
@@ -335,6 +345,7 @@ static class Ui
 {
 	public static Action<string> Log = Console.WriteLine;
 	public static Action<string> Status = s => { try { Console.Title = "SlrrMp " + s; } catch (IOException) { } };
+	public static Action<string> GameFound = _ => { };
 	public static Func<string, bool> Ask = q =>
 	{
 		Console.Write(q + " [Y/n] ");
@@ -351,19 +362,45 @@ class Peer(int id)
 	public bool Warned;
 }
 
+// which game this build supports, and whether the installed game is that build
+static class GameInfo
+{
+	public const string Supported = "Street Legal Racing Redline v2.3.1 (Steam)";
+	// StreetLegal_Redline.exe SHA-256 -> version; the bridge's patch is made for these builds
+	static readonly Dictionary<string, string> Known = new()
+	{
+		["f44fb88a4335c657e20701cdb84afb8d1d85f7c3aceb93d30113e6e6e44fefc2"] = "v2.3.1",
+	};
+
+	public static string Check(string? gameDir)
+	{
+		var exe = gameDir == null ? "" : Path.Combine(gameDir, "StreetLegal_Redline.exe");
+		if (!File.Exists(exe)) return "Game: not found yet (start it once with SlrrMp open)";
+		try
+		{
+			using var f = File.OpenRead(exe);
+			var h = Convert.ToHexStringLower(SHA256.HashData(f));
+			return Known.TryGetValue(h, out var v) ? $"Game: {v}, supported" : "Game: unknown build, multiplayer may not work";
+		}
+		catch (IOException) { return "Game: can't read the exe"; }
+	}
+}
+
 static class Updater
 {
-	public const string DefaultRepo = ""; // "owner/repo" once the public GitHub repo exists
+	public const string DefaultRepo = "Jabelius/SLRR-MP";
 	public static readonly string Version = typeof(Updater).Assembly.GetName().Version!.ToString(3);
 
-	// offers the latest GitHub release (asset SLRR-MP.zip), installs it over this folder, re-runs install.ps1, restarts
-	public static async Task Run(string? repoSetting, string[] args)
+	// offers the latest GitHub release (asset SLRR-MP.zip), installs it over this folder, re-runs install.ps1, restarts;
+	// otherwise returns what happened, for the user
+	public static async Task<string> Run(string? repoSetting, string[] args)
 	{
 		var repo = string.IsNullOrWhiteSpace(repoSetting) ? DefaultRepo : repoSetting;
 		var dir = AppContext.BaseDirectory;
 		var self = Environment.ProcessPath!;
 		try { File.Delete(self + ".old"); } catch (IOException) { } catch (UnauthorizedAccessException) { }
-		if (repo == "" || !File.Exists(Path.Combine(dir, "install.ps1"))) return; // no repo yet, or a dev build
+		if (repo == "") return "Updates are not set up (no release repo).";
+		if (!File.Exists(Path.Combine(dir, "install.ps1"))) return "Dev build: updates only work from the installed SLRR-MP folder.";
 		try
 		{
 			using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
@@ -372,15 +409,15 @@ static class Updater
 			var api = repo.StartsWith("http") ? repo : $"https://api.github.com/repos/{repo}/releases/latest"; // URL = self-hosted latest.json
 			using var doc = JsonDocument.Parse(await http.GetStringAsync(api, check.Token));
 			var tag = doc.RootElement.GetProperty("tag_name").GetString()!.TrimStart('v');
-			if (!System.Version.TryParse(tag, out var latest) || latest <= System.Version.Parse(Version)) return;
+			if (!System.Version.TryParse(tag, out var latest) || latest <= System.Version.Parse(Version)) return $"You have the latest version ({Version}).";
 			var url = doc.RootElement.GetProperty("assets").EnumerateArray()
 				.Where(a => a.GetProperty("name").GetString() == "SLRR-MP.zip")
 				.Select(a => a.GetProperty("browser_download_url").GetString()).FirstOrDefault();
-			if (url == null) return;
+			if (url == null) return $"Release {tag} has no SLRR-MP.zip yet.";
 
-			if (!Ui.Ask($"SLRR-MP {tag} is available (you have {Version}). Update now?")) return;
+			if (!Ui.Ask($"SLRR-MP {tag} is available (you have {Version}). Update now?")) return $"Update to {tag} skipped.";
 			while (Process.GetProcessesByName("StreetLegal_Redline").Length > 0)
-				if (!Ui.Ask("Close the game first. Continue the update?")) return;
+				if (!Ui.Ask("Close the game first. Continue the update?")) return "Update cancelled.";
 
 			Ui.Log("Downloading update...");
 			var tmp = Path.Combine(Path.GetTempPath(), "slrr-mp-update");
@@ -415,11 +452,16 @@ static class Updater
 			foreach (var a in args) again.ArgumentList.Add(a);
 			Process.Start(again);
 			Environment.Exit(0);
+			return "";
+		}
+		catch (HttpRequestException e) when (e.StatusCode == HttpStatusCode.NotFound)
+		{
+			return $"No releases published yet ({Version} is the newest).";
 		}
 		catch (Exception e) when (e is HttpRequestException or OperationCanceledException or IOException or JsonException
 			or KeyNotFoundException or InvalidOperationException or InvalidDataException or UnauthorizedAccessException)
 		{
-			Ui.Log($"Update check failed ({e.Message}), continuing.");
+			return $"Update check failed: {e.Message}";
 		}
 	}
 }
