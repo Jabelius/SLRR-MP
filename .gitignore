@@ -1,8 +1,10 @@
 bin/
 obj/
 *.dll
-!re/**
 backup-original/
 *.log
 dist/
 PLAN.md
+*.lib
+*.pdb
+re/
