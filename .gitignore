@@ -4,3 +4,4 @@ obj/
 !re/**
 backup-original/
 *.log
+dist/
