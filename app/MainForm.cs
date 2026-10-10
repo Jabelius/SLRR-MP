@@ -37,8 +37,6 @@ class MainForm : Form
 		this.cfgPath = cfgPath;
 		Text = $"SLRR-MP {Updater.Version}";
 		Font = new Font("Segoe UI", 9f);
-		ClientSize = new Size(620, 400);
-		MinimumSize = new Size(560, 260);
 		name.Text = cfg.LastName ?? Proto.CleanName(Environment.UserName);
 		host.Text = cfg.LastHost ?? "";
 
@@ -63,6 +61,13 @@ class MainForm : Form
 
 		Load += async (_, _) =>
 		{
+			// fit the measured top row at any display scaling (fixed pixel sizes don't scale with the font)
+			float k = DeviceDpi / 96f;
+			int w = Math.Max(top.GetPreferredSize(Size.Empty).Width + (int)(16 * k), (int)(760 * k));
+			ClientSize = new Size(w, (int)(480 * k));
+			MinimumSize = new Size(Width, (int)(300 * k));
+			CenterToScreen();
+
 			Ui.Log = s => BeginInvoke(() => log.AppendText(s + Environment.NewLine));
 			Ui.Status = s => BeginInvoke(() => status.Text = s);
 			Ui.Ask = q => (bool)Invoke(() => MessageBox.Show(this, q, "SLRR-MP", MessageBoxButtons.YesNo) == DialogResult.Yes);
