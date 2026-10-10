@@ -1,6 +1,10 @@
 # SLRR-MP install. Run with the game closed. Originals go to backup-original\ once.
-param([string]$Game = '<game folder>')
+param([string]$Game)
 $ErrorActionPreference = 'Stop'
+# buddy zip: this folder sits inside the game folder; dev repo: default install
+if (-not $Game) { $Game = Split-Path $PSScriptRoot }
+if (-not (Test-Path (Join-Path $Game 'StreetLegal_Redline.exe'))) { $Game = '<game folder>' }
+if (-not (Test-Path (Join-Path $Game 'StreetLegal_Redline.exe'))) { throw 'Game not found. Put the SLRR-MP folder inside the game folder.' }
 if (Get-Process StreetLegal_Redline -ErrorAction SilentlyContinue) { throw 'Close the game first.' }
 $bak = Join-Path $PSScriptRoot 'backup-original'
 $cityJava = 'sl\Scripts\game\src\City.java'
@@ -34,4 +38,4 @@ Copy-Item (Join-Path $PSScriptRoot 'mod\MpSync.java') (Join-Path $Game 'sl\Scrip
 $ini = Join-Path $Game 'slrr-mp.ini'
 if (-not (Test-Path $ini)) { Copy-Item (Join-Path $PSScriptRoot 'mod\slrr-mp.ini') $ini }
 Copy-Item (Join-Path $PSScriptRoot 'native\dinput8.dll') $dll -Force
-'Installed.'
+"Installed into $Game."
