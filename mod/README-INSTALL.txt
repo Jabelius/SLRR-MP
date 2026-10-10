@@ -14,15 +14,19 @@ INSTALL
 PLAY
 1. Start SLRR-MP\SlrrMp.exe (Windows may warn about an unknown app:
    More info > Run anyway). Allow it through the firewall if asked.
-2. One player picks Host. The others pick Join and type the host's IP.
-   The host must forward UDP port 27650 on their router to their PC,
-   or everyone uses the same VPN (Tailscale, ZeroTier, Radmin VPN) and
-   joins the host's VPN IP.
-3. Keep SlrrMp.exe open, start the game and drive out into the City.
-   Other players show up as stock copies of their car model.
+2. Type your name. One player clicks Host. The others type the host's IP
+   and click Join. The host must forward UDP port 27650 on their router to
+   their PC, or everyone uses the same VPN (Tailscale, ZeroTier, Radmin VPN)
+   and joins the host's VPN IP.
+3. Keep SlrrMp open, start the game and drive out into the City.
+   Other players show up as copies of their own car, with a dot on the
+   minimap. Type in SlrrMp's chat box to talk; it shows up in the game.
 
-Solo test: pick Fake in SlrrMp.exe. A copy of your car follows you 2 s
-behind, 5 m to the side.
+Solo test: click "Solo test". A copy of your car follows you 2 s behind,
+5 m to the side.
+
+Updates: when a new version is out, SlrrMp asks on start and updates itself
+and the game files (close the game first).
 
 SETTINGS
 SlrrMp.json (next to SlrrMp.exe, created on first start): ports, send rate.

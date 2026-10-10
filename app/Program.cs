@@ -4,7 +4,7 @@
 //   SlrrMp fake                         offline: your own trail replayed as a second car
 //   --echo (join)                       send the host's car back as yours, offset: tests the full network path
 //   --bridge <port>                     local game bridge port (run a second instance without a game)
-// Type a line + Enter to chat; it shows up in everyone's game. Status is in the window title.
+// No arguments: opens the window (MainForm.cs). With arguments it runs headless; stdin lines are chat.
 // Updates: on start, a newer GitHub release (Updater.DefaultRepo or UpdateRepo in SlrrMp.json) is offered Y/N.
 // Car look: each player's saved car (main file + its .1 .2 ... part files, bundled) is pulled in chunks by
 // content hash (K announce, G request, D data) and unpacked for the bridge as slrr-mp-cars/<hash>.car[.n].
@@ -16,7 +16,15 @@ using System.Text;
 using System.Security.Cryptography;
 using System.Text.Json;
 
-var cfg = Config.Load(Path.Combine(AppContext.BaseDirectory, "SlrrMp.json"));
+var cfgPath = Path.Combine(AppContext.BaseDirectory, "SlrrMp.json");
+var cfg = Config.Load(cfgPath);
+if (args.Length == 0)
+{
+	Gui.Run(cfg, cfgPath);
+	return;
+}
+
+// headless: SlrrMp host|join <ip>|fake [--name N] [--bridge P] [--echo]; stdin lines are chat
 var argl = args.ToList();
 string? Opt(string key)
 {
@@ -30,293 +38,308 @@ await Updater.Run(cfg.UpdateRepo, args);
 bool echo = argl.Remove("--echo");
 var name = Proto.CleanName(Opt("--name") ?? Environment.UserName);
 int bridgePort = int.Parse(Opt("--bridge") ?? cfg.BridgePort.ToString());
-var mode = argl.ElementAtOrDefault(0)?.ToLowerInvariant();
-var target = argl.ElementAtOrDefault(1);
-if (mode is not ("host" or "join" or "fake"))
-{
-	Console.Write("Your name: ");
-	name = Proto.CleanName(Console.ReadLine() ?? name);
-	Console.Write("[H]ost, [J]oin or [F]ake peer test? ");
-	mode = (Console.ReadLine() ?? "").Trim().ToLowerInvariant() switch { "j" or "join" => "join", "f" or "fake" => "fake", _ => "host" };
-	if (mode == "join") { Console.Write("Host IP: "); target = Console.ReadLine(); }
-}
-
-var clock = Stopwatch.StartNew();
-double Now() => clock.Elapsed.TotalSeconds;
-var gate = new object();
-int rx = 0, tx = 0;
-
-var bridge = Proto.Udp(new IPEndPoint(IPAddress.Loopback, bridgePort));
-IPEndPoint? game = null;
-double gameSeen = -99;
-void ToGame(string msg)
-{
-	if (game == null) return;
-	bridge.Send(Encoding.ASCII.GetBytes(msg), game);
-}
-
-UdpClient? net = null;
-IPEndPoint? hostEp = null;
-var peers = new Dictionary<IPEndPoint, Peer>();
-int nextId = 1;
-double ping = -1, lastSent = -99;
-bool warned = false;
-var trail = new Queue<(double at, string state)>();
-var cars = new CarStore();
-string? gameDir = null, ownHash = null;
-var carOf = new Dictionary<int, string>(); // remote id -> car hash (client: from host's K)
-
-void NetSend(string msg, IPEndPoint to) { net!.Send(Encoding.ASCII.GetBytes(msg), to); tx++; }
-
-string? lastOwn = null; // last own state; null once "away" went out
-
-void SendOwn(string state)
-{
-	if (mode == "fake") trail.Enqueue((Now(), state));
-	else if (echo || !Due(state)) { }
-	else if (mode == "host") foreach (var ep in peers.Keys) NetSend($"S 0 {name} {state}", ep);
-	else NetSend($"S {name} {state}", hostEp!);
-	if (!state.EndsWith(" 0")) lastOwn = null;
-}
-
-// throttle to SendHz, but never drop a state with flags (away)
-bool Due(string state)
-{
-	double now = Now();
-	if (now - lastSent < 1.0 / cfg.SendHz && state.EndsWith(" 0")) return false;
-	lastSent = now;
-	return true;
-}
-
-if (mode == "host")
-{
-	net = Proto.Udp(new IPEndPoint(IPAddress.Any, cfg.Port));
-	Console.WriteLine($"Hosting on UDP {cfg.Port} as {name}. Buddies join your public/VPN IP (forward UDP {cfg.Port}).");
-}
-else if (mode == "join")
-{
-	hostEp = Proto.Resolve(target ?? "", cfg.Port);
-	net = Proto.Udp(new IPEndPoint(IPAddress.Any, 0));
-	Console.WriteLine($"Joining {hostEp} as {name}{(echo ? " (echo)" : "")}.");
-}
-else Console.WriteLine($"Fake peer: your trail replayed {cfg.FakeDelayMs} ms later, {cfg.FakeOffsetM} m to the side.");
-Console.WriteLine($"Game bridge on 127.0.0.1:{bridgePort}. Ctrl+C quits.");
-
-// own car state from the game
-_ = Task.Run(async () =>
-{
-	while (true)
-	{
-		UdpReceiveResult r;
-		try { r = await bridge.ReceiveAsync(); } catch (SocketException) { continue; }
-		var state = Encoding.ASCII.GetString(r.Buffer);
-		if (state.StartsWith("H ") || state.StartsWith("F "))
-		{
-			lock (gate) OnGameFile(state);
-			continue;
-		}
-		if (!Proto.ValidState(state)) continue;
-		lock (gate)
-		{
-			game = r.RemoteEndPoint;
-			gameSeen = Now();
-			lastOwn = state;
-			SendOwn(state);
-		}
-	}
-});
-
-// other players
-if (net != null) _ = Task.Run(async () =>
-{
-	while (true)
-	{
-		UdpReceiveResult r;
-		try { r = await net.ReceiveAsync(); } catch (SocketException) { continue; }
-		if (r.Buffer.Length > 1400) continue;
-		var msg = Encoding.ASCII.GetString(r.Buffer);
-		var f = msg.Split(' ', 3);
-		lock (gate)
-		{
-			rx++;
-			if (OnCarMessage(msg, r.RemoteEndPoint)) continue;
-			if (mode == "host")
-			{
-				if (f.Length < 2 || (f[0] != "S" && f[0] != "P" && f[0] != "C")) continue;
-				if (!peers.TryGetValue(r.RemoteEndPoint, out var p))
-				{
-					p = peers[r.RemoteEndPoint] = new Peer(nextId++);
-					Console.WriteLine($"+ peer {p.Id} {r.RemoteEndPoint}");
-				}
-				p.Seen = Now();
-				if (f[0] == "C")
-				{
-					var text = Proto.CleanText(msg[2..]);
-					if (text.Length == 0) continue;
-					Chat(p.Name, text);
-					foreach (var ep in peers.Keys) if (!ep.Equals(r.RemoteEndPoint)) NetSend($"C {p.Id} {p.Name} {text}", ep);
-					continue;
-				}
-				if (f.Length < 3) continue;
-				if (f[0] == "P")
-				{
-					var pp = f[2].Split(' ');
-					p.Name = Proto.CleanName(pp[0]);
-					if (pp.ElementAtOrDefault(1) != Updater.Version && !p.Warned)
-					{
-						p.Warned = true;
-						Console.WriteLine($"! {p.Name} runs SlrrMp {pp.ElementAtOrDefault(1) ?? "?"}, you run {Updater.Version}: update both");
-					}
-					NetSend($"Q {f[1]} {Updater.Version}", r.RemoteEndPoint);
-					continue;
-				}
-				if (!Proto.ValidState(f[2])) continue;
-				p.Name = Proto.CleanName(f[1]);
-				var relay = $"S {p.Id} {p.Name} {f[2]}";
-				ToGame(relay);
-				foreach (var ep in peers.Keys) if (!ep.Equals(r.RemoteEndPoint)) NetSend(relay, ep);
-			}
-			else if (r.RemoteEndPoint.Equals(hostEp))
-			{
-				if (f[0] == "Q" && double.TryParse(f[1], out var sent))
-				{
-					ping = Now() - sent;
-					var hv = f.ElementAtOrDefault(2) ?? "?";
-					if (hv != Updater.Version && !warned) { warned = true; Console.WriteLine($"! host runs SlrrMp {hv}, you run {Updater.Version}: update both"); }
-				}
-				if (f[0] == "C" && msg.Split(' ', 4) is [_, _, var who, var said]) Chat(Proto.CleanName(who), Proto.CleanText(said));
-				var s = msg.Split(' ', 4);
-				if (f[0] != "S" || s.Length < 4 || !int.TryParse(s[1], out _) || !Proto.ValidState(s[3])) continue;
-				ToGame($"S {s[1]} {Proto.CleanName(s[2])} {s[3]}");
-				if (echo && s[1] == "0" && Due(s[3])) NetSend($"S {name} {Proto.Offset(s[3], cfg.FakeOffsetM)}", hostEp!);
-			}
-		}
-	}
-});
-
-void Chat(string who, string text)
-{
-	Console.WriteLine($"{who}: {text}");
-	ToGame($"C {who}: {text}");
-}
-
-// chat: lines typed here go to everyone's game
+var mode = argl.ElementAtOrDefault(0)?.ToLowerInvariant() is "join" or "fake" ? argl[0].ToLowerInvariant() : "host";
 _ = Task.Run(() =>
 {
-	while (Console.ReadLine() is { } line)
+	while (Console.ReadLine() is { } line) Relay.Say(line);
+});
+await Relay.Run(cfg, mode, name, argl.ElementAtOrDefault(1), echo, bridgePort);
+
+// relay between the game bridge and the other players; runs until the process exits
+static class Relay
+{
+	public static Action<string> Say = _ => { };
+
+	public static async Task Run(Config cfg, string mode, string name, string? target, bool echo, int bridgePort)
 	{
-		var text = Proto.CleanText(line);
-		if (text.Length == 0) continue;
-		lock (gate)
+		var clock = Stopwatch.StartNew();
+		double Now() => clock.Elapsed.TotalSeconds;
+		var gate = new object();
+		int rx = 0, tx = 0;
+
+		var bridge = Proto.Udp(new IPEndPoint(IPAddress.Loopback, bridgePort));
+		IPEndPoint? game = null;
+		double gameSeen = -99;
+		void ToGame(string msg)
 		{
-			if (mode == "host") foreach (var ep in peers.Keys) NetSend($"C 0 {name} {text}", ep);
-			else if (mode == "join") NetSend($"C {text}", hostEp!);
-			else ToGame($"C {name}: {text}"); // fake: see it yourself
+			if (game == null) return;
+			bridge.Send(Encoding.ASCII.GetBytes(msg), game);
 		}
-	}
-});
 
-// game told us its folder ("H dir") or where it saved our car ("F rel")
-void OnGameFile(string m)
-{
-	if (m[0] == 'H') { gameDir = m[2..]; return; }
-	if (gameDir == null) return;
-	try
-	{
-		var bytes = CarStore.Bundle(Path.Combine(gameDir, m[2..]));
-		if (CarStore.Valid(bytes)) ownHash = cars.Add(bytes);
-	}
-	catch (IOException) { }
-}
+		UdpClient? net = null;
+		IPEndPoint? hostEp = null;
+		var peers = new Dictionary<IPEndPoint, Peer>();
+		int nextId = 1;
+		double ping = -1, lastSent = -99;
+		bool warned = false;
+		var trail = new Queue<(double at, string state)>();
+		var cars = new CarStore();
+		string? gameDir = null, ownHash = null;
+		var carOf = new Dictionary<int, string>(); // remote id -> car hash (client: from host's K)
 
-// K/G/D car file messages; true if handled
-bool OnCarMessage(string msg, IPEndPoint from)
-{
-	var f = msg.Split(' ');
-	switch (f[0])
-	{
-		case "K" when mode == "host" && f.Length == 3 && peers.TryGetValue(from, out var p) && CarStore.IsHash(f[1]) && int.TryParse(f[2], out var size):
-			p.Car = f[1];
-			cars.Want(f[1], size, from);
-			return true;
-		case "K" when mode == "join" && f.Length == 4 && int.TryParse(f[1], out var id) && CarStore.IsHash(f[2]) && int.TryParse(f[3], out var size2):
-			carOf[id] = f[2];
-			cars.Want(f[2], size2, hostEp!);
-			if (echo && id == 0) ownHash = f[2]; // echo car = host's car
-			return true;
-		case "G" when f.Length == 3 && int.TryParse(f[2], out var idx):
-			if (cars.Chunk(f[1], idx) is { } d) NetSend(d, from);
-			return true;
-		case "D" when f.Length == 5 && int.TryParse(f[2], out var di) && int.TryParse(f[3], out var total):
-			try { cars.Got(f[1], di, total, Convert.FromBase64String(f[4])); } catch (FormatException) { }
-			return true;
-	}
-	return false;
-}
+		void NetSend(string msg, IPEndPoint to) { net!.Send(Encoding.ASCII.GetBytes(msg), to); tx++; }
 
-// tell the bridge which file each remote id drives
-void CarsToGame()
-{
-	if (gameDir == null) return;
-	var known = mode == "host" ? peers.Values.Where(p => p.Car != null).Select(p => (p.Id, p.Car!)) : carOf.Select(kv => (kv.Key, kv.Value));
-	if (mode == "fake" && ownHash != null) known = [(99, ownHash)];
-	foreach (var (id, hash) in known)
-		if (cars.Write(hash, gameDir) is { } rel) ToGame($"F {id} {rel}");
-}
+		string? lastOwn = null; // last own state; null once "away" went out
 
-// pull missing car chunks
-if (net != null) _ = Task.Run(async () =>
-{
-	while (true)
-	{
-		lock (gate)
-			foreach (var (msg, to) in cars.Requests()) NetSend(msg, to);
-		await Task.Delay(100);
-	}
-});
-
-// fake peer replay
-if (mode == "fake") _ = Task.Run(async () =>
-{
-	while (true)
-	{
-		lock (gate)
-			while (trail.Count > 0 && Now() - trail.Peek().at >= cfg.FakeDelayMs / 1000.0)
-				ToGame($"S 99 fake {Proto.Offset(trail.Dequeue().state, cfg.FakeOffsetM)}");
-		await Task.Delay(5);
-	}
-});
-
-// once a second: ping, prune, status
-while (true)
-{
-	await Task.Delay(1000);
-	lock (gate)
-	{
-		if (mode == "join") NetSend($"P {Now():0.000} {name} {Updater.Version}", hostEp!);
-		if (ownHash != null && cars.Size(ownHash) is int own)
+		void SendOwn(string state)
 		{
-			if (mode == "join") NetSend($"K {ownHash} {own}", hostEp!);
-			if (mode == "host")
-				foreach (var ep in peers.Keys)
+			if (mode == "fake") trail.Enqueue((Now(), state));
+			else if (echo || !Due(state)) { }
+			else if (mode == "host") foreach (var ep in peers.Keys) NetSend($"S 0 {name} {state}", ep);
+			else NetSend($"S {name} {state}", hostEp!);
+			if (!state.EndsWith(" 0")) lastOwn = null;
+		}
+
+		// throttle to SendHz, but never drop a state with flags (away)
+		bool Due(string state)
+		{
+			double now = Now();
+			if (now - lastSent < 1.0 / cfg.SendHz && state.EndsWith(" 0")) return false;
+			lastSent = now;
+			return true;
+		}
+
+		if (mode == "host")
+		{
+			net = Proto.Udp(new IPEndPoint(IPAddress.Any, cfg.Port));
+			Ui.Log($"Hosting on UDP {cfg.Port} as {name}. Buddies join your public/VPN IP (forward UDP {cfg.Port}).");
+		}
+		else if (mode == "join")
+		{
+			hostEp = Proto.Resolve(target ?? "", cfg.Port);
+			net = Proto.Udp(new IPEndPoint(IPAddress.Any, 0));
+			Ui.Log($"Joining {hostEp} as {name}{(echo ? " (echo)" : "")}.");
+		}
+		else Ui.Log($"Fake peer: your trail replayed {cfg.FakeDelayMs} ms later, {cfg.FakeOffsetM} m to the side.");
+		Ui.Log($"Game bridge on 127.0.0.1:{bridgePort}. Start the game and drive into the City.");
+
+		// own car state from the game
+		_ = Task.Run(async () =>
+		{
+			while (true)
+			{
+				UdpReceiveResult r;
+				try { r = await bridge.ReceiveAsync(); } catch (SocketException) { continue; }
+				var state = Encoding.ASCII.GetString(r.Buffer);
+				if (state.StartsWith("H ") || state.StartsWith("F "))
 				{
-					NetSend($"K 0 {ownHash} {own}", ep);
-					foreach (var p in peers.Values) if (p.Car != null && cars.Size(p.Car) is int ps) NetSend($"K {p.Id} {p.Car} {ps}", ep);
+					lock (gate) OnGameFile(state);
+					continue;
 				}
-		}
-		CarsToGame();
-		// game left the City, quit or crashed without saying so: tell the others
-		if (lastOwn != null && Now() - gameSeen > 1) SendOwn(lastOwn[..lastOwn.LastIndexOf(' ')] + " 1");
-		foreach (var ep in peers.Where(kv => Now() - kv.Value.Seen > cfg.PeerTimeoutMs / 1000.0).Select(kv => kv.Key).ToList())
+				if (!Proto.ValidState(state)) continue;
+				lock (gate)
+				{
+					game = r.RemoteEndPoint;
+					gameSeen = Now();
+					lastOwn = state;
+					SendOwn(state);
+				}
+			}
+		});
+
+		// other players
+		if (net != null) _ = Task.Run(async () =>
 		{
-			Console.WriteLine($"- peer {peers[ep].Id} {peers[ep].Name} timed out");
-			peers.Remove(ep);
+			while (true)
+			{
+				UdpReceiveResult r;
+				try { r = await net.ReceiveAsync(); } catch (SocketException) { continue; }
+				if (r.Buffer.Length > 1400) continue;
+				var msg = Encoding.ASCII.GetString(r.Buffer);
+				var f = msg.Split(' ', 3);
+				lock (gate)
+				{
+					rx++;
+					if (OnCarMessage(msg, r.RemoteEndPoint)) continue;
+					if (mode == "host")
+					{
+						if (f.Length < 2 || (f[0] != "S" && f[0] != "P" && f[0] != "C")) continue;
+						if (!peers.TryGetValue(r.RemoteEndPoint, out var p))
+						{
+							p = peers[r.RemoteEndPoint] = new Peer(nextId++);
+							Ui.Log($"+ peer {p.Id} {r.RemoteEndPoint}");
+						}
+						p.Seen = Now();
+						if (f[0] == "C")
+						{
+							var text = Proto.CleanText(msg[2..]);
+							if (text.Length == 0) continue;
+							Chat(p.Name, text);
+							foreach (var ep in peers.Keys) if (!ep.Equals(r.RemoteEndPoint)) NetSend($"C {p.Id} {p.Name} {text}", ep);
+							continue;
+						}
+						if (f.Length < 3) continue;
+						if (f[0] == "P")
+						{
+							var pp = f[2].Split(' ');
+							p.Name = Proto.CleanName(pp[0]);
+							if (pp.ElementAtOrDefault(1) != Updater.Version && !p.Warned)
+							{
+								p.Warned = true;
+								Ui.Log($"! {p.Name} runs SlrrMp {pp.ElementAtOrDefault(1) ?? "?"}, you run {Updater.Version}: update both");
+							}
+							NetSend($"Q {f[1]} {Updater.Version}", r.RemoteEndPoint);
+							continue;
+						}
+						if (!Proto.ValidState(f[2])) continue;
+						p.Name = Proto.CleanName(f[1]);
+						var relay = $"S {p.Id} {p.Name} {f[2]}";
+						ToGame(relay);
+						foreach (var ep in peers.Keys) if (!ep.Equals(r.RemoteEndPoint)) NetSend(relay, ep);
+					}
+					else if (r.RemoteEndPoint.Equals(hostEp))
+					{
+						if (f[0] == "Q" && double.TryParse(f[1], out var sent))
+						{
+							ping = Now() - sent;
+							var hv = f.ElementAtOrDefault(2) ?? "?";
+							if (hv != Updater.Version && !warned) { warned = true; Ui.Log($"! host runs SlrrMp {hv}, you run {Updater.Version}: update both"); }
+						}
+						if (f[0] == "C" && msg.Split(' ', 4) is [_, _, var who, var said]) Chat(Proto.CleanName(who), Proto.CleanText(said));
+						var s = msg.Split(' ', 4);
+						if (f[0] != "S" || s.Length < 4 || !int.TryParse(s[1], out _) || !Proto.ValidState(s[3])) continue;
+						ToGame($"S {s[1]} {Proto.CleanName(s[2])} {s[3]}");
+						if (echo && s[1] == "0" && Due(s[3])) NetSend($"S {name} {Proto.Offset(s[3], cfg.FakeOffsetM)}", hostEp!);
+					}
+				}
+			}
+		});
+
+		void Chat(string who, string text)
+		{
+			Ui.Log($"{who}: {text}");
+			ToGame($"C {who}: {text}");
 		}
-		var who = mode == "host" ? $"peers={peers.Count} [{string.Join(",", peers.Values.Select(p => p.Name))}]"
-			: mode == "join" ? $"ping={(ping < 0 ? "-" : $"{ping * 1000:0}ms")}" : "fake";
-		Console.Title = $"SlrrMp {mode} {who} game={(Now() - gameSeen < 2 ? "in city" : "-")} rx={rx}/s tx={tx}/s";
-		rx = tx = 0;
+
+		// chat typed by this player goes to everyone's game
+		Say = line =>
+		{
+			var text = Proto.CleanText(line);
+			if (text.Length == 0) return;
+			lock (gate)
+			{
+				Ui.Log($"{name}: {text}");
+				if (mode == "host") foreach (var ep in peers.Keys) NetSend($"C 0 {name} {text}", ep);
+				else if (mode == "join") NetSend($"C {text}", hostEp!);
+				else ToGame($"C {name}: {text}"); // fake: see it yourself
+			}
+		};
+
+		// game told us its folder ("H dir") or where it saved our car ("F rel")
+		void OnGameFile(string m)
+		{
+			if (m[0] == 'H') { gameDir = m[2..]; return; }
+			if (gameDir == null) return;
+			try
+			{
+				var bytes = CarStore.Bundle(Path.Combine(gameDir, m[2..]));
+				if (CarStore.Valid(bytes)) ownHash = cars.Add(bytes);
+			}
+			catch (IOException) { }
+		}
+
+		// K/G/D car file messages; true if handled
+		bool OnCarMessage(string msg, IPEndPoint from)
+		{
+			var f = msg.Split(' ');
+			switch (f[0])
+			{
+				case "K" when mode == "host" && f.Length == 3 && peers.TryGetValue(from, out var p) && CarStore.IsHash(f[1]) && int.TryParse(f[2], out var size):
+					p.Car = f[1];
+					cars.Want(f[1], size, from);
+					return true;
+				case "K" when mode == "join" && f.Length == 4 && int.TryParse(f[1], out var id) && CarStore.IsHash(f[2]) && int.TryParse(f[3], out var size2):
+					carOf[id] = f[2];
+					cars.Want(f[2], size2, hostEp!);
+					if (echo && id == 0) ownHash = f[2]; // echo car = host's car
+					return true;
+				case "G" when f.Length == 3 && int.TryParse(f[2], out var idx):
+					if (cars.Chunk(f[1], idx) is { } d) NetSend(d, from);
+					return true;
+				case "D" when f.Length == 5 && int.TryParse(f[2], out var di) && int.TryParse(f[3], out var total):
+					try { cars.Got(f[1], di, total, Convert.FromBase64String(f[4])); } catch (FormatException) { }
+					return true;
+			}
+			return false;
+		}
+
+		// tell the bridge which file each remote id drives
+		void CarsToGame()
+		{
+			if (gameDir == null) return;
+			var known = mode == "host" ? peers.Values.Where(p => p.Car != null).Select(p => (p.Id, p.Car!)) : carOf.Select(kv => (kv.Key, kv.Value));
+			if (mode == "fake" && ownHash != null) known = [(99, ownHash)];
+			foreach (var (id, hash) in known)
+				if (cars.Write(hash, gameDir) is { } rel) ToGame($"F {id} {rel}");
+		}
+
+		// pull missing car chunks
+		if (net != null) _ = Task.Run(async () =>
+		{
+			while (true)
+			{
+				lock (gate)
+					foreach (var (msg, to) in cars.Requests()) NetSend(msg, to);
+				await Task.Delay(100);
+			}
+		});
+
+		// fake peer replay
+		if (mode == "fake") _ = Task.Run(async () =>
+		{
+			while (true)
+			{
+				lock (gate)
+					while (trail.Count > 0 && Now() - trail.Peek().at >= cfg.FakeDelayMs / 1000.0)
+						ToGame($"S 99 fake {Proto.Offset(trail.Dequeue().state, cfg.FakeOffsetM)}");
+				await Task.Delay(5);
+			}
+		});
+
+		// once a second: ping, prune, status
+		while (true)
+		{
+			await Task.Delay(1000);
+			lock (gate)
+			{
+				if (mode == "join") NetSend($"P {Now():0.000} {name} {Updater.Version}", hostEp!);
+				if (ownHash != null && cars.Size(ownHash) is int own)
+				{
+					if (mode == "join") NetSend($"K {ownHash} {own}", hostEp!);
+					if (mode == "host")
+						foreach (var ep in peers.Keys)
+						{
+							NetSend($"K 0 {ownHash} {own}", ep);
+							foreach (var p in peers.Values) if (p.Car != null && cars.Size(p.Car) is int ps) NetSend($"K {p.Id} {p.Car} {ps}", ep);
+						}
+				}
+				CarsToGame();
+				// game left the City, quit or crashed without saying so: tell the others
+				if (lastOwn != null && Now() - gameSeen > 1) SendOwn(lastOwn[..lastOwn.LastIndexOf(' ')] + " 1");
+				foreach (var ep in peers.Where(kv => Now() - kv.Value.Seen > cfg.PeerTimeoutMs / 1000.0).Select(kv => kv.Key).ToList())
+				{
+					Ui.Log($"- peer {peers[ep].Id} {peers[ep].Name} timed out");
+					peers.Remove(ep);
+				}
+				var who = mode == "host" ? $"peers={peers.Count} [{string.Join(",", peers.Values.Select(p => p.Name))}]"
+					: mode == "join" ? $"ping={(ping < 0 ? "-" : $"{ping * 1000:0}ms")}" : "fake";
+				Ui.Status($"{mode}  {who}  game: {(Now() - gameSeen < 2 ? "in city" : "not in city")}  rx {rx}/s  tx {tx}/s");
+				rx = tx = 0;
+			}
+		}
 	}
+}
+
+// where the relay and updater talk to the user: console by default, the window when it is open
+static class Ui
+{
+	public static Action<string> Log = Console.WriteLine;
+	public static Action<string> Status = s => { try { Console.Title = "SlrrMp " + s; } catch (IOException) { } };
+	public static Func<string, bool> Ask = q =>
+	{
+		Console.Write(q + " [Y/n] ");
+		return (Console.ReadLine() ?? "").Trim().ToLowerInvariant() is not ("n" or "no");
+	};
 }
 
 class Peer(int id)
@@ -355,15 +378,11 @@ static class Updater
 				.Select(a => a.GetProperty("browser_download_url").GetString()).FirstOrDefault();
 			if (url == null) return;
 
-			Console.Write($"SlrrMp {tag} is available (you have {Version}). Update now? [Y/n] ");
-			if ((Console.ReadLine() ?? "").Trim().ToLowerInvariant() is "n" or "no") return;
+			if (!Ui.Ask($"SLRR-MP {tag} is available (you have {Version}). Update now?")) return;
 			while (Process.GetProcessesByName("StreetLegal_Redline").Length > 0)
-			{
-				Console.Write("Close the game first, then press Enter. ");
-				Console.ReadLine();
-			}
+				if (!Ui.Ask("Close the game first. Continue the update?")) return;
 
-			Console.WriteLine("Downloading...");
+			Ui.Log("Downloading update...");
 			var tmp = Path.Combine(Path.GetTempPath(), "slrr-mp-update");
 			if (Directory.Exists(tmp)) Directory.Delete(tmp, true);
 			Directory.CreateDirectory(tmp);
@@ -391,7 +410,7 @@ static class Updater
 
 			var install = Process.Start(new ProcessStartInfo("powershell", $"-NoProfile -ExecutionPolicy Bypass -File \"{Path.Combine(dir, "install.ps1")}\"") { UseShellExecute = false })!;
 			install.WaitForExit();
-			Console.WriteLine(install.ExitCode == 0 ? $"Updated to {tag}, restarting." : "Game files step failed: run install.bat. Restarting.");
+			Ui.Log(install.ExitCode == 0 ? $"Updated to {tag}, restarting." : "Game files step failed: run install.bat. Restarting.");
 			var again = new ProcessStartInfo(self) { UseShellExecute = false };
 			foreach (var a in args) again.ArgumentList.Add(a);
 			Process.Start(again);
@@ -400,7 +419,7 @@ static class Updater
 		catch (Exception e) when (e is HttpRequestException or OperationCanceledException or IOException or JsonException
 			or KeyNotFoundException or InvalidOperationException or InvalidDataException or UnauthorizedAccessException)
 		{
-			Console.WriteLine($"Update check failed ({e.Message}), continuing.");
+			Ui.Log($"Update check failed ({e.Message}), continuing.");
 		}
 	}
 }
@@ -519,6 +538,8 @@ record Config
 	public int FakeDelayMs { get; init; } = 2000;
 	public float FakeOffsetM { get; init; } = 5;
 	public string? UpdateRepo { get; init; } // "owner/repo" or a releases/latest-style JSON URL; null = Updater.DefaultRepo
+	public string? LastName { get; init; }
+	public string? LastHost { get; init; }
 
 	static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
 
@@ -526,9 +547,11 @@ record Config
 	{
 		if (File.Exists(path)) return JsonSerializer.Deserialize<Config>(File.ReadAllText(path)) ?? new();
 		var c = new Config();
-		File.WriteAllText(path, JsonSerializer.Serialize(c, Json));
+		c.Save(path);
 		return c;
 	}
+
+	public void Save(string path) => File.WriteAllText(path, JsonSerializer.Serialize(this, Json));
 }
 
 static class Proto
