@@ -5,9 +5,12 @@ import java.util.resource.*;
 import java.net.*;
 
 //SLRR-MP: sends the player's car state to the dinput8.dll bridge and mirrors remote players as ghost cars.
-//The bridge interpolates; this only spawns, moves and removes stock cars.
+//The bridge interpolates; this only spawns, moves and removes ghosts (the owner's saved car once SlrrMp
+//has transferred it, a stock car of the same model until then).
 public class MpSync implements Runnable
 {
+	final static String OWN_CAR = "save/temp/mp_own.car";
+
 	Thread	thread;
 	GameRef	map;
 	Vehicle	car;
@@ -36,6 +39,10 @@ public class MpSync implements Runnable
 		}
 		log("enter city type=" + type + " color=" + color + " tick=" + tickMs);
 
+		//exact look for the others: SlrrMp sends this file to them
+		car.save(OWN_CAR);
+		NetworkEngine.httpRequest("CAR", "", "", OWN_CAR);
+
 		thread = new Thread(this, "slrr-mp sync");
 		thread.start();
 	}
@@ -60,7 +67,7 @@ public class MpSync implements Runnable
 		}
 	}
 
-	//"n id type color x y z yaw pitch roll ..."
+	//"n id type color car x y z yaw pitch roll ...", car = file path or "-"
 	public void apply(String snap)
 	{
 		int i;
@@ -70,15 +77,16 @@ public class MpSync implements Runnable
 		int n = snap.token(0, " ").intValue();
 		for(int k=0; k<n; k++)
 		{
-			int b = 1 + k*9;
+			int b = 1 + k*10;
 			int id = snap.token(b, " ").intValue();
 			int gtype = snap.token(b+1, " ").intValue();
 			int gcolor = snap.token(b+2, " ").intValue();
+			String gcar = snap.token(b+3, " ");
 
 			MpGhost found = null;
 			for(i=0; i<ghosts.size(); i++) { g = ghosts.elementAt(i); if(g.id == id) found = g; }
 			g = found;
-			if(g && (g.type != gtype || g.color != gcolor))
+			if(g && (g.type != gtype || g.color != gcolor || g.car != gcar))
 			{
 				g.destroy();
 				ghosts.removeElement(g);
@@ -86,13 +94,13 @@ public class MpSync implements Runnable
 			}
 			if(!g)
 			{
-				g = new MpGhost(map, id, gtype, gcolor);
+				g = new MpGhost(map, id, gtype, gcolor, gcar);
 				ghosts.addElement(g);
-				log("ghost " + id + " spawned type=" + gtype + " color=" + gcolor);
+				log("ghost " + id + " spawned type=" + gtype + " color=" + gcolor + " car=" + gcar + " loaded=" + g.loaded);
 			}
 			g.seen = 1;
-			g.vhc.setMatrix(new Vector3(snap.token(b+3, " ").floatValue(), snap.token(b+4, " ").floatValue(), snap.token(b+5, " ").floatValue()),
-				new Ypr(snap.token(b+6, " ").floatValue(), snap.token(b+7, " ").floatValue(), snap.token(b+8, " ").floatValue()));
+			g.vhc.setMatrix(new Vector3(snap.token(b+4, " ").floatValue(), snap.token(b+5, " ").floatValue(), snap.token(b+6, " ").floatValue()),
+				new Ypr(snap.token(b+7, " ").floatValue(), snap.token(b+8, " ").floatValue(), snap.token(b+9, " ").floatValue()));
 		}
 
 		for(i=ghosts.size()-1; i>=0; i--)
@@ -122,16 +130,29 @@ public class MpSync implements Runnable
 
 public class MpGhost
 {
-	int	id, type, color, seen;
+	int	id, type, color, seen, loaded;
+	String	car;
 	Vehicle	vhc;
 
-	public MpGhost(GameRef map, int id_, int type_, int color_)
+	public MpGhost(GameRef map, int id_, int type_, int color_, String car_)
 	{
 		id = id_;
 		type = type_;
 		color = color_;
+		car = car_;
+		if(car != "-")
+		{
+			vhc = Vehicle.load(car, map);
+			if(vhc && vhc.chassis)
+			{
+				vhc.setMatrix(null, null); //stop its physics like a stock spawn
+				loaded = 1;
+				return;
+			}
+			if(vhc) vhc.destroy(); //parts this game doesn't have: fall back to stock
+		}
 		int c = color;
-		if(c < 0 || c >= GameLogic.CARCOLORS.length) c = 0; //custom paint: stock color for now
+		if(c < 0 || c >= GameLogic.CARCOLORS.length) c = 0; //custom paint: closest is a stock color
 		vhc = new Vehicle(map, type, c, 1.0, 1.0, 1.0, 1.0); //spawns with physics stopped
 	}
 

@@ -42,12 +42,35 @@ static Sample *nth(Peer *q, int i) { return &q->s[(q->head + i) % HIST]; } // 0 
 
 static void drop_peer(Peer *q) { memset(q, 0, sizeof *q); }
 
+// car file per remote id, from SlrrMp once the transfer completed: "F id save/temp/mp/<hash>.car"
+static struct { int id; char path[96]; } cars[MAXP];
+
+static const char *car_of(int id)
+{
+	for (int i = 0; i < MAXP; i++) if (cars[i].path[0] && cars[i].id == id) return cars[i].path;
+	return "-";
+}
+
+static void set_car(int id, const char *path)
+{
+	int slot = -1;
+	for (int i = 0; i < MAXP; i++) {
+		if (cars[i].path[0] && cars[i].id == id) { slot = i; break; }
+		if (!cars[i].path[0] && slot < 0) slot = i;
+	}
+	if (slot < 0) return; // ponytail: table full, ghost stays stock
+	cars[slot].id = id;
+	snprintf(cars[slot].path, sizeof cars[slot].path, "%s", path);
+}
+
 // "S id name t type color x y z yaw pitch roll vx vy vz flags"; now = local seconds
 static void on_packet(const char *msg, double now)
 {
 	int id, type, color, flags;
 	double t;
 	Sample x;
+	char path[96];
+	if (sscanf(msg, "F %d %95s", &id, path) == 2) { set_car(id, path); return; }
 	if (sscanf(msg, "S %d %*s %lf %d %d %f %f %f %f %f %f %f %f %f %d", &id, &t, &type, &color,
 		&x.p[0], &x.p[1], &x.p[2], &x.r[0], &x.r[1], &x.r[2], &x.v[0], &x.v[1], &x.v[2], &flags) != 14) return;
 	x.t = t;
@@ -102,7 +125,7 @@ static void interp(Peer *q, double now, float p[3], float r[3])
 	for (int k = 0; k < 3; k++) { p[k] = a->p[k] + (b->p[k] - a->p[k]) * f; r[k] = lerp_angle(a->r[k], b->r[k], f); }
 }
 
-// "n id type color x y z yaw pitch roll ..." for the script
+// "n id type color car x y z yaw pitch roll ..." for the script; car = file path or "-"
 static void snapshot(char *out, size_t cap, double now)
 {
 	int n = 0;
@@ -114,8 +137,8 @@ static void snapshot(char *out, size_t cap, double now)
 		if ((now - q->last_rx) * 1000 > cfg_timeout_ms) { drop_peer(q); continue; }
 		float p[3], r[3];
 		interp(q, now, p, r);
-		len += snprintf(body + len, sizeof body - len, " %d %d %d %.3f %.3f %.3f %.4f %.4f %.4f",
-			q->id, q->type, q->color, p[0], p[1], p[2], r[0], r[1], r[2]);
+		len += snprintf(body + len, sizeof body - len, " %d %d %d %s %.3f %.3f %.3f %.4f %.4f %.4f",
+			q->id, q->type, q->color, car_of(q->id), p[0], p[1], p[2], r[0], r[1], r[2]);
 		if (len >= sizeof body) break;
 		n++;
 	}
@@ -126,6 +149,7 @@ static void snapshot(char *out, size_t cap, double now)
 
 static SOCKET sock = INVALID_SOCKET;
 static struct sockaddr_in app_addr;
+static char game_dir[MAX_PATH], own_car[96];
 
 static double now_s(void)
 {
@@ -152,13 +176,24 @@ static int net_init(void)
 	return 1;
 }
 
+static void send_app(const char *m) { sendto(sock, m, (int)strlen(m), 0, (struct sockaddr *)&app_addr, sizeof app_addr); }
+
 static void net_pump(const char *own_state)
 {
 	if (!net_init()) return;
-	if (own_state && *own_state) sendto(sock, own_state, (int)strlen(own_state), 0, (struct sockaddr *)&app_addr, sizeof app_addr);
+	if (own_state && *own_state) send_app(own_state);
 	char buf[1024];
 	int n;
 	double now = now_s();
+	// game folder + own car file, repeated so a SlrrMp started later still learns them
+	static double last_hello = -99;
+	if (own_car[0] && now - last_hello > 2) {
+		last_hello = now;
+		snprintf(buf, sizeof buf, "H %s", game_dir);
+		send_app(buf);
+		snprintf(buf, sizeof buf, "F %s", own_car);
+		send_app(buf);
+	}
 	// errors (e.g. WSAECONNRESET while SlrrMp is not running) just end the drain
 	while ((n = recv(sock, buf, sizeof buf - 1, 0)) > 0) {
 		buf[n] = 0;
@@ -179,6 +214,10 @@ static void *__cdecl mp_native(void *ctx)
 	if (!strcmp(method, "CFG")) {
 		snprintf(reply, sizeof reply, "%d", cfg_tick_ms);
 		return make_str(*(void **)ctx, reply);
+	}
+	if (!strcmp(method, "CAR")) { // own car saved to this game-relative path
+		snprintf(own_car, sizeof own_car, "%s", body ? body : "");
+		return 0;
 	}
 	if (!strcmp(method, "MP")) {
 		net_pump(body);
@@ -274,6 +313,9 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r)
 		char *file = strrchr(p, '\\') + 1;
 		strcpy(file, "slrr-mp.log");
 		logfile = fopen(p, "w");
+		file[-1] = 0;
+		strcpy(game_dir, p);
+		file[-1] = '\\';
 		strcpy(file, "slrr-mp.ini");
 		cfg_bridge_port = GetPrivateProfileIntA("mp", "bridge_port", cfg_bridge_port, p);
 		cfg_delay_ms = GetPrivateProfileIntA("mp", "interp_delay_ms", cfg_delay_ms, p);
