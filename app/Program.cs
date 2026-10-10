@@ -5,9 +5,11 @@
 //   --echo (join)                       send the host's car back as yours, offset: tests the full network path
 //   --bridge <port>                     local game bridge port (run a second instance without a game)
 // Type a line + Enter to chat; it shows up in everyone's game. Status is in the window title.
+// Updates: on start, a newer GitHub release (Updater.DefaultRepo or UpdateRepo in SlrrMp.json) is offered Y/N.
 // Car look: each player's saved car (main file + its .1 .2 ... part files, bundled) is pulled in chunks by
 // content hash (K announce, G request, D data) and unpacked for the bridge as slrr-mp-cars/<hash>.car[.n].
 using System.Diagnostics;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -24,6 +26,7 @@ string? Opt(string key)
 	argl.RemoveRange(i, 2);
 	return v;
 }
+await Updater.Run(cfg.UpdateRepo, args);
 bool echo = argl.Remove("--echo");
 var name = Proto.CleanName(Opt("--name") ?? Environment.UserName);
 int bridgePort = int.Parse(Opt("--bridge") ?? cfg.BridgePort.ToString());
@@ -57,6 +60,7 @@ IPEndPoint? hostEp = null;
 var peers = new Dictionary<IPEndPoint, Peer>();
 int nextId = 1;
 double ping = -1, lastSent = -99;
+bool warned = false;
 var trail = new Queue<(double at, string state)>();
 var cars = new CarStore();
 string? gameDir = null, ownHash = null;
@@ -154,7 +158,18 @@ if (net != null) _ = Task.Run(async () =>
 					continue;
 				}
 				if (f.Length < 3) continue;
-				if (f[0] == "P") { p.Name = Proto.CleanName(f[2]); NetSend($"Q {f[1]}", r.RemoteEndPoint); continue; }
+				if (f[0] == "P")
+				{
+					var pp = f[2].Split(' ');
+					p.Name = Proto.CleanName(pp[0]);
+					if (pp.ElementAtOrDefault(1) != Updater.Version && !p.Warned)
+					{
+						p.Warned = true;
+						Console.WriteLine($"! {p.Name} runs SlrrMp {pp.ElementAtOrDefault(1) ?? "?"}, you run {Updater.Version}: update both");
+					}
+					NetSend($"Q {f[1]} {Updater.Version}", r.RemoteEndPoint);
+					continue;
+				}
 				if (!Proto.ValidState(f[2])) continue;
 				p.Name = Proto.CleanName(f[1]);
 				var relay = $"S {p.Id} {p.Name} {f[2]}";
@@ -163,7 +178,12 @@ if (net != null) _ = Task.Run(async () =>
 			}
 			else if (r.RemoteEndPoint.Equals(hostEp))
 			{
-				if (f[0] == "Q" && double.TryParse(f[1], out var sent)) ping = Now() - sent;
+				if (f[0] == "Q" && double.TryParse(f[1], out var sent))
+				{
+					ping = Now() - sent;
+					var hv = f.ElementAtOrDefault(2) ?? "?";
+					if (hv != Updater.Version && !warned) { warned = true; Console.WriteLine($"! host runs SlrrMp {hv}, you run {Updater.Version}: update both"); }
+				}
 				if (f[0] == "C" && msg.Split(' ', 4) is [_, _, var who, var said]) Chat(Proto.CleanName(who), Proto.CleanText(said));
 				var s = msg.Split(' ', 4);
 				if (f[0] != "S" || s.Length < 4 || !int.TryParse(s[1], out _) || !Proto.ValidState(s[3])) continue;
@@ -273,7 +293,7 @@ while (true)
 	await Task.Delay(1000);
 	lock (gate)
 	{
-		if (mode == "join") NetSend($"P {Now():0.000} {name}", hostEp!);
+		if (mode == "join") NetSend($"P {Now():0.000} {name} {Updater.Version}", hostEp!);
 		if (ownHash != null && cars.Size(ownHash) is int own)
 		{
 			if (mode == "join") NetSend($"K {ownHash} {own}", hostEp!);
@@ -305,6 +325,84 @@ class Peer(int id)
 	public string Name = "?";
 	public double Seen;
 	public string? Car;
+	public bool Warned;
+}
+
+static class Updater
+{
+	public const string DefaultRepo = ""; // "owner/repo" once the public GitHub repo exists
+	public static readonly string Version = typeof(Updater).Assembly.GetName().Version!.ToString(3);
+
+	// offers the latest GitHub release (asset SLRR-MP.zip), installs it over this folder, re-runs install.ps1, restarts
+	public static async Task Run(string? repoSetting, string[] args)
+	{
+		var repo = string.IsNullOrWhiteSpace(repoSetting) ? DefaultRepo : repoSetting;
+		var dir = AppContext.BaseDirectory;
+		var self = Environment.ProcessPath!;
+		try { File.Delete(self + ".old"); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+		if (repo == "" || !File.Exists(Path.Combine(dir, "install.ps1"))) return; // no repo yet, or a dev build
+		try
+		{
+			using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+			http.DefaultRequestHeaders.UserAgent.ParseAdd("SlrrMp/" + Version);
+			using var check = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+			var api = repo.StartsWith("http") ? repo : $"https://api.github.com/repos/{repo}/releases/latest"; // URL = self-hosted latest.json
+			using var doc = JsonDocument.Parse(await http.GetStringAsync(api, check.Token));
+			var tag = doc.RootElement.GetProperty("tag_name").GetString()!.TrimStart('v');
+			if (!System.Version.TryParse(tag, out var latest) || latest <= System.Version.Parse(Version)) return;
+			var url = doc.RootElement.GetProperty("assets").EnumerateArray()
+				.Where(a => a.GetProperty("name").GetString() == "SLRR-MP.zip")
+				.Select(a => a.GetProperty("browser_download_url").GetString()).FirstOrDefault();
+			if (url == null) return;
+
+			Console.Write($"SlrrMp {tag} is available (you have {Version}). Update now? [Y/n] ");
+			if ((Console.ReadLine() ?? "").Trim().ToLowerInvariant() is "n" or "no") return;
+			while (Process.GetProcessesByName("StreetLegal_Redline").Length > 0)
+			{
+				Console.Write("Close the game first, then press Enter. ");
+				Console.ReadLine();
+			}
+
+			Console.WriteLine("Downloading...");
+			var tmp = Path.Combine(Path.GetTempPath(), "slrr-mp-update");
+			if (Directory.Exists(tmp)) Directory.Delete(tmp, true);
+			Directory.CreateDirectory(tmp);
+			var zip = Path.Combine(tmp, "SLRR-MP.zip");
+			await File.WriteAllBytesAsync(zip, await http.GetByteArrayAsync(url));
+			ZipFile.ExtractToDirectory(zip, tmp);
+			var src = Path.Combine(tmp, "SLRR-MP");
+
+			// a running exe can be renamed but not overwritten
+			File.Move(self, self + ".old");
+			try
+			{
+				foreach (var f in Directory.GetFiles(src, "*", SearchOption.AllDirectories))
+				{
+					var to = Path.Combine(dir, Path.GetRelativePath(src, f));
+					Directory.CreateDirectory(Path.GetDirectoryName(to)!);
+					File.Copy(f, to, true);
+				}
+			}
+			catch
+			{
+				if (!File.Exists(self)) File.Move(self + ".old", self);
+				throw;
+			}
+
+			var install = Process.Start(new ProcessStartInfo("powershell", $"-NoProfile -ExecutionPolicy Bypass -File \"{Path.Combine(dir, "install.ps1")}\"") { UseShellExecute = false })!;
+			install.WaitForExit();
+			Console.WriteLine(install.ExitCode == 0 ? $"Updated to {tag}, restarting." : "Game files step failed: run install.bat. Restarting.");
+			var again = new ProcessStartInfo(self) { UseShellExecute = false };
+			foreach (var a in args) again.ArgumentList.Add(a);
+			Process.Start(again);
+			Environment.Exit(0);
+		}
+		catch (Exception e) when (e is HttpRequestException or OperationCanceledException or IOException or JsonException
+			or KeyNotFoundException or InvalidOperationException or InvalidDataException or UnauthorizedAccessException)
+		{
+			Console.WriteLine($"Update check failed ({e.Message}), continuing.");
+		}
+	}
 }
 
 // car files by content hash: complete ones can be served, wanted ones are pulled chunk by chunk
@@ -420,6 +518,7 @@ record Config
 	public int PeerTimeoutMs { get; init; } = 5000;
 	public int FakeDelayMs { get; init; } = 2000;
 	public float FakeOffsetM { get; init; } = 5;
+	public string? UpdateRepo { get; init; } // "owner/repo" or a releases/latest-style JSON URL; null = Updater.DefaultRepo
 
 	static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
 

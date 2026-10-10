@@ -6,6 +6,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- release tag must be v + this, e.g. v0.2.0 -->
+    <Version>0.2.0</Version>
     <!-- buddy exe: dotnet publish -c Release -r win-x64 -o ../dist -->
     <SelfContained Condition="'$(RuntimeIdentifier)' != ''">true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
