@@ -17,6 +17,8 @@
     <EnableSingleFileAnalyzer>false</EnableSingleFileAnalyzer>
     <EnableTrimAnalyzer>false</EnableTrimAnalyzer>
     <EnableAotAnalyzer>false</EnableAotAnalyzer>
+    <!-- no pdb: its path (with the builder's user folder) would be baked into the exe -->
+    <DebugType>none</DebugType>
   </PropertyGroup>
 
 </Project>
